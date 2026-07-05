@@ -723,7 +723,7 @@
         </button>
         <div class="drawer-content">
             <div class="drawer-section">
-                <select id="campusDropdown" onChange="centerMapOnCampus(this.options[this.selectedIndex].value);">
+                <select id="campusDropdown" onChange="onCampusChange(this.options[this.selectedIndex].value);">
                     <option value="">Loading campuses...</option>
                 </select>
             </div>
@@ -835,6 +835,9 @@
     </div>
 
     <script>
+        window.DEFAULT_CAMPUS_ID = {{ default_campus_id|default:"null" }};
+        window.DEFAULT_MAP_LON = {{ default_longitude|default:"-110.7919148" }};
+        window.DEFAULT_MAP_LAT = {{ default_latitude|default:"38.4065268" }};
         let clipboarding = false;
         navigator.permissions.query({ name: "clipboard-write" }).then((result) => {
             if (result.state === "granted" || result.state === "prompt") {
@@ -915,7 +918,7 @@
                 // Add default option
                 const defaultOption = document.createElement('option');
                 defaultOption.value = '';
-                defaultOption.text = 'Zoom to campus...';
+                defaultOption.text = 'Campus...';
                 dropdown.appendChild(defaultOption);
                 
                 // Add campus options
@@ -933,6 +936,9 @@
                         elevation: campus.elevation
                     };
                 });
+                if (window.DEFAULT_CAMPUS_ID && campusData[window.DEFAULT_CAMPUS_ID]) {
+                    dropdown.value = String(window.DEFAULT_CAMPUS_ID);
+                }
             } catch (error) {
                 console.error('Error loading campuses:', error);
                 const dropdown = document.getElementById('campusDropdown');
@@ -953,6 +959,26 @@
             
             // Set campus zoom level to 14
             map.getView().setZoom(14);
+        }
+
+        async function onCampusChange(campusId) {
+            centerMapOnCampus(campusId);
+            const payload = { campus_id: campusId ? parseInt(campusId, 10) : null };
+            try {
+                const response = await fetch('/profile/campus', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRFToken': getCookie('csrftoken'),
+                    },
+                    body: JSON.stringify(payload),
+                });
+                if (!response.ok) {
+                    console.error('Failed to save campus preference', await response.text());
+                }
+            } catch (e) {
+                console.error('Error saving campus preference', e);
+            }
         }
 
         async function populateHistory() {
@@ -1096,10 +1122,40 @@
         checkTexts(true)
         setInterval(checkTexts, 15000);
 
+        function applyNextParamToLoginUrl(loginUrl) {
+            const u = new URL(loginUrl, window.location.origin);
+            const returnPath = window.location.pathname + window.location.search + window.location.hash;
+            u.searchParams.set('next', returnPath);
+            return u.href;
+        }
+
         function updateGeoJSON() {
-            fetch(geojsonUrl)
-                .then(response => response.json())
+            fetch(geojsonUrl, {
+                redirect: 'manual',
+                credentials: 'same-origin',
+            })
+                .then(response => {
+                    if (response.status >= 300 && response.status < 400) {
+                        const loc = response.headers.get('Location');
+                        window.location.href = applyNextParamToLoginUrl(
+                            loc != null && loc !== '' ? loc : '/accounts/login/'
+                        );
+                        return;
+                    }
+                    if (response.type === 'opaqueredirect') {
+                        window.location.href = applyNextParamToLoginUrl('/accounts/login/');
+                        return;
+                    }
+                    if (!response.ok) {
+                        console.error('Error loading GeoJSON:', response.status);
+                        return;
+                    }
+                    return response.json();
+                })
                 .then(data => {
+                    if (data === undefined) {
+                        return;
+                    }
                     // vectorSource holds stations
                     vectorSource.clear();
                     displayWaypoints();
@@ -1545,11 +1601,14 @@
             source: aircraftSource,
             style: function (feature) {
                 const track = feature.get('track');
-                const alt = feature.get('alt_baro') || 0;
+                const altRaw = feature.get('altitude');
+                const alt = (altRaw != null && altRaw !== undefined && !isNaN(altRaw)) ? altRaw : 0;
                 const speed = feature.get('gs') || 0;
-                
-                // Create airplane icon
-                const airplaneIcon = createAirplaneIcon(alt, speed);
+                const source = feature.get('source');
+
+                const iconSrc = source === 'remoteid'
+                    ? createDroneIcon(alt, speed)
+                    : createAirplaneIcon(alt, speed);
                 
                 // Convert track (degrees, 0=north, 90=east) to OpenLayers rotation (radians)
                 // In OpenLayers, rotation is counter-clockwise from east (0 radians = east)
@@ -1567,7 +1626,7 @@
                 
                 return new ol.style.Style({
                     image: new ol.style.Icon({
-                        src: airplaneIcon,
+                        src: iconSrc,
                         imgSize: [24, 24],
                         anchor: [0.5, 0.5],
                         anchorXUnits: 'fraction',
@@ -1584,7 +1643,7 @@
             let r = 0, g = 0, b = 0;
             if (altitude > 0) {
                 // Scale from light blue (low) to dark blue (high)
-                const altFactor = Math.min(altitude / 40000, 1); // Max at 40k feet
+                const altFactor = Math.min(altitude / 12000, 1); // altitude in meters from API
                 r = Math.floor(50 + altFactor * 100);
                 g = Math.floor(100 + altFactor * 50);
                 b = Math.floor(200 + altFactor * 55);
@@ -1605,6 +1664,38 @@
             `;
             
             return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgAirplane);
+        }
+
+        function createDroneIcon(altitude, speed) {
+            let r = 0, g = 0, b = 0;
+            if (altitude > 0) {
+                const altFactor = Math.min(altitude / 12000, 1); // altitude in meters from API
+                r = Math.floor(50 + altFactor * 100);
+                g = Math.floor(100 + altFactor * 50);
+                b = Math.floor(200 + altFactor * 55);
+            } else {
+                r = 100; g = 100; b = 100;
+            }
+            const stroke = 'rgb(0, 0, 0)';
+            const fill = 'rgb(' + r + ', ' + g + ', ' + b + ')';
+            // Same -90 group as airplane so heading rotation matches ADS-B markers.
+            const svgDrone = `
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" height="24" width="24">
+                    <g transform="rotate(-90 12 12)">
+                        <line x1="12" y1="12" x2="5" y2="5" style="stroke: ${stroke}; stroke-width: 1.2;"/>
+                        <line x1="12" y1="12" x2="19" y2="5" style="stroke: ${stroke}; stroke-width: 1.2;"/>
+                        <line x1="12" y1="12" x2="5" y2="19" style="stroke: ${stroke}; stroke-width: 1.2;"/>
+                        <line x1="12" y1="12" x2="19" y2="19" style="stroke: ${stroke}; stroke-width: 1.2;"/>
+                        <circle cx="5" cy="5" r="2.2" style="fill: ${fill}; stroke: ${stroke}; stroke-width: 0.5;"/>
+                        <circle cx="19" cy="5" r="2.2" style="fill: ${fill}; stroke: ${stroke}; stroke-width: 0.5;"/>
+                        <circle cx="5" cy="19" r="2.2" style="fill: ${fill}; stroke: ${stroke}; stroke-width: 0.5;"/>
+                        <circle cx="19" cy="19" r="2.2" style="fill: ${fill}; stroke: ${stroke}; stroke-width: 0.5;"/>
+                        <rect x="9" y="9" width="6" height="6" rx="1.2" style="fill: ${fill}; stroke: ${stroke}; stroke-width: 0.5;"/>
+                        <path d="M 12 3 L 14 8 L 10 8 Z" style="fill: ${fill}; stroke: ${stroke}; stroke-width: 0.5;"/>
+                    </g>
+                </svg>
+            `;
+            return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgDrone);
         }
 
         let aircraftData = {}; // Store aircraft by hex code for tracking
@@ -1697,7 +1788,10 @@
                     // Update all aircraft properties
                     feature.set('lat', aircraft.lat);
                     feature.set('lon', aircraft.lon);
-                    feature.set('alt_baro', aircraft.alt_baro || 0);
+                    const altVal = (aircraft.altitude != null && aircraft.altitude !== undefined && !isNaN(aircraft.altitude))
+                        ? aircraft.altitude
+                        : 0;
+                    feature.set('altitude', altVal);
                     feature.set('gs', aircraft.gs || 0);
                     // Track can be null/undefined, so handle it properly
                     feature.set('track', aircraft.track !== null && aircraft.track !== undefined ? aircraft.track : null);
@@ -1706,6 +1800,7 @@
                     feature.set('category', aircraft.category || '');
                     feature.set('messages', aircraft.messages || 0);
                     feature.set('seen', aircraft.seen || 0);
+                    feature.set('source', aircraft.source || null);
                     feature.set('updated_at', aircraft.updated_at || null);
                     
                     // Force style recalculation by changing a property
@@ -1713,7 +1808,10 @@
                     
                     // Create label for popup
                     const flight = aircraft.flight ? aircraft.flight.trim() : hex;
-                    const alt = aircraft.alt_baro ? `${Math.round(aircraft.alt_baro)} ft` : 'Unknown';
+                    const altNum = (aircraft.altitude != null && aircraft.altitude !== undefined && !isNaN(aircraft.altitude))
+                        ? aircraft.altitude
+                        : null;
+                    const alt = altNum != null ? `${Math.round(altNum)} m` : 'Unknown';
                     const speed = aircraft.gs ? `${Math.round(aircraft.gs)} kts` : 'Unknown';
                     const heading = aircraft.track ? `${Math.round(aircraft.track)}°` : 'Unknown';
                     const age = calculateAge(aircraft.updated_at);
@@ -1749,7 +1847,7 @@
                 aircraftLayer,
             ],
             view: new ol.View({
-                center: ol.proj.fromLonLat([-110.7919148, 38.4065268]),
+                center: ol.proj.fromLonLat([window.DEFAULT_MAP_LON, window.DEFAULT_MAP_LAT]),
                 zoom: 13,
             }),
         });
@@ -1866,7 +1964,8 @@
                     info.style.top = event.pixel[1] + 'px';
                     info.style.visibility = 'visible';
                     const flight = feature.get('flight') || feature.get('hex');
-                    const alt = feature.get('alt_baro') ? `${Math.round(feature.get('alt_baro'))} ft` : 'Unknown';
+                    const altNum = feature.get('altitude');
+                    const alt = (altNum != null && altNum !== undefined && !isNaN(altNum)) ? `${Math.round(altNum)} m` : 'Unknown';
                     const speed = feature.get('gs') ? `${Math.round(feature.get('gs'))} kts` : 'Unknown';
                     const heading = feature.get('track') ? `${Math.round(feature.get('track'))}°` : 'Unknown';
                     const age = calculateAge(feature.get('updated_at'));
@@ -1976,7 +2075,8 @@
                 if (type === 'aircraft') {
                     // Show aircraft info on hover
                     const flight = feature.get('flight') || feature.get('hex');
-                    const alt = feature.get('alt_baro') ? `${Math.round(feature.get('alt_baro'))} ft` : 'Unknown';
+                    const altNumHover = feature.get('altitude');
+                    const alt = (altNumHover != null && altNumHover !== undefined && !isNaN(altNumHover)) ? `${Math.round(altNumHover)} m` : 'Unknown';
                     const speed = feature.get('gs') ? `${Math.round(feature.get('gs'))} kts` : 'Unknown';
                     const heading = feature.get('track') ? `${Math.round(feature.get('track'))}°` : 'Unknown';
                     const age = calculateAge(feature.get('updated_at'));

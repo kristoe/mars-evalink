@@ -1,6 +1,7 @@
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
 from django import db
+from django.db import IntegrityError
 import time
 import os
 import json
@@ -10,20 +11,27 @@ from django.conf import settings
 
 def on_connect(client, _userdata, _flags, _rc):
     client.subscribe(f'{os.getenv("MQTT_TOPIC")}/+/json/#')
-    client.subscribe('adsb/aircraft/+')
+    client.subscribe(f'{os.getenv("MQTT_TOPIC")}/aircraft/+')
 
 def on_disconnect(client, _userdata, _rc):
     pass #print("on_disconnect?")
 
 def on_message(_client, _userdata, msg):
-    # Handle ADSB aircraft messages
-    if msg.topic.startswith('adsb/aircraft/'):
+    # Handle aircraft messages
+    aircraft_topic_prefix = f'{os.getenv("MQTT_TOPIC")}/aircraft/'
+    if msg.topic.startswith(aircraft_topic_prefix):
         try:
             hex_code = msg.topic.split('/')[-1]
             message = json.loads(msg.payload)
-            handler.process_adsb_aircraft(hex_code, message)
+            handler.process_aircraft(hex_code, message)
+        except IntegrityError as error:
+            if 'unique_aircraftpositionlog_aircraft_lat_lon_minute' in str(error):
+                return
+            print(f'handler failed to process aircraft {msg.topic}: {error} {traceback.print_tb(error.__traceback__)}')
+            db.close_old_connections()
+            time.sleep(1)
         except Exception as error:
-            print(f'handler failed to process ADSB aircraft {msg.topic}: {error} {traceback.print_tb(error.__traceback__)}')
+            print(f'handler failed to process aircraft {msg.topic}: {error} {traceback.print_tb(error.__traceback__)}')
             db.close_old_connections()
             time.sleep(1)
         return

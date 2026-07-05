@@ -1,0 +1,224 @@
+# docker-compose for evalink on ZimaOS (or any Docker host).
+#
+# ZimaOS/CasaOS requires long-form port mappings (target/published/protocol)
+# and an x-casaos block; short forms like "0.0.0.0:1883:1883" show Host=0
+# and Container=NaN in the import UI.
+#
+# Topology:
+#   - db        Postgres, internal compose network only (no host port).
+#   - pgadmin   pgAdmin 4 HTTP UI on host 18001 for database management.
+#   - mqtt      Mosquitto, exposed on the host so Cloudflare Spectrum can
+#               front it with TLS on the public side and forward plain MQTT
+#               (port 1883) to this broker.
+#   - web       Django + Gunicorn, exposed on the host so Cloudflare can
+#               proxy HTTPS to it on plain HTTP.
+#
+# Environment: create /DATA/AppData/evalink/.env from .env.docker.example.
+# CasaOS does not load a sibling .env when importing compose; each service
+# uses env_file with that absolute path instead of ${VAR} interpolation.
+# Host bind IPs in ports: are literals (CasaOS cannot interpolate .env there).
+#
+# On ZimaOS, place the repo under /DATA/AppData/evalink so bind mounts resolve.
+
+name: evalink
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: evalink-db
+    restart: unless-stopped
+    env_file:
+      - /DATA/AppData/evalink/.env
+    environment:
+      POSTGRES_DB: evalink
+      POSTGRES_USER: evalink
+    volumes:
+      - type: volume
+        source: db_data
+        target: /var/lib/postgresql/data
+    networks:
+      - evalink
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U evalink -d evalink
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  pgadmin:
+    image: dpage/pgadmin4:8
+    container_name: evalink-pgadmin
+    restart: unless-stopped
+    env_file:
+      - /DATA/AppData/evalink/.env
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@evalink.local
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    volumes:
+      - type: bind
+        source: /DATA/AppData/evalink/pgadmin/entrypoint.sh
+        target: /usr/local/bin/pgadmin-entrypoint.sh
+        read_only: true
+      - type: volume
+        source: pgadmin_data
+        target: /var/lib/pgadmin
+    entrypoint: ["/usr/local/bin/pgadmin-entrypoint.sh"]
+    ports:
+      - target: 80
+        host_ip: 0.0.0.0
+        published: "18001"
+        protocol: tcp
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - evalink
+    x-casaos:
+      ports:
+        - container: "80"
+          description:
+            en_us: pgAdmin Postgres web UI (HTTP on host port 18001)
+
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: evalink-mqtt
+    restart: unless-stopped
+    env_file:
+      - /DATA/AppData/evalink/.env
+    ports:
+      - target: 1883
+        host_ip: 0.0.0.0
+        published: "1883"
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: /DATA/AppData/evalink/mosquitto/config
+        target: /mosquitto/config
+        read_only: true
+      - type: bind
+        source: /DATA/AppData/evalink/mosquitto/entrypoint.sh
+        target: /usr/local/bin/mosquitto-entrypoint.sh
+        read_only: true
+      - type: volume
+        source: mqtt_data
+        target: /mosquitto/data
+      - type: volume
+        source: mqtt_log
+        target: /mosquitto/log
+    entrypoint: ["/usr/local/bin/mosquitto-entrypoint.sh"]
+    command: ["mosquitto", "-c", "/mosquitto/config/mosquitto.conf"]
+    networks:
+      - evalink
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mosquitto_sub -h 127.0.0.1 -p 1883 -u "$$MQTT_USER" -P "$$MQTT_PASSWORD" -t '$$SYS/broker/uptime' -C 1 -W 3 >/dev/null 2>&1 || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    x-casaos:
+      ports:
+        - container: "1883"
+          description:
+            en_us: Plain MQTT (Cloudflare Spectrum terminates TLS on 8883)
+
+  web:
+    # ZimaOS cannot import custom build contexts; use the official Python image
+    # and bind-mount the repo. docker-entrypoint.sh pip-installs on first boot.
+    image: python:3.12-slim-bookworm
+    container_name: evalink-web
+    restart: unless-stopped
+    working_dir: /app/evalink
+    entrypoint: ["/bin/sh", "/app/docker-entrypoint.sh"]
+    command: ["gunicorn"]
+    depends_on:
+      db:
+        condition: service_healthy
+      mqtt:
+        condition: service_started
+    env_file:
+      - /DATA/AppData/evalink/.env
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      DJANGO_SETTINGS_MODULE: evalink.settings
+      HOST: db
+      PORT: "5432"
+      NAME: evalink
+      DBUSER: evalink
+      SSLMODE: disable
+      MQTT_SERVER: mqtt
+      MQTT_PORT: "1883"
+      MQTT_TLS: ""
+      STATIC_ROOT: /app/static
+      MEDIA_ROOT: /app/media
+      WEB_PORT: "8000"
+      DJANGO_ALLOW_LAN: "1"
+    volumes:
+      - type: bind
+        source: /DATA/AppData/evalink
+        target: /app
+      - type: volume
+        source: web_static
+        target: /app/static
+      - type: volume
+        source: web_media
+        target: /app/media
+    ports:
+      - target: 8000
+        host_ip: 0.0.0.0
+        published: "18000"
+        protocol: tcp
+    networks:
+      - evalink
+    x-casaos:
+      ports:
+        - container: "8000"
+          description:
+            en_us: Django web UI (plain HTTP; Cloudflare proxies HTTPS)
+
+networks:
+  evalink:
+    driver: bridge
+
+volumes:
+  db_data:
+  pgadmin_data:
+  mqtt_data:
+  mqtt_log:
+  web_static:
+  web_media:
+
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  main: web
+  author: self
+  category: self
+  hostname: ""
+  icon: https://cdn.jsdelivr.net/gh/IceWhaleTech/CasaOS-AppStore@main/Apps/PostgreSQL/icon.png
+  index: /
+  is_uncontrolled: false
+  port_map: "18000"
+  scheme: http
+  store_app_id: evalink
+  title:
+    custom: evalink
+    en_us: evalink
+  tips:
+    before_install:
+      en_us: |
+        Copy the repo to `/DATA/AppData/evalink` before installing (rsync or git clone).
+        Create `/DATA/AppData/evalink/.env` from `.env.docker.example` and set
+        POSTGRES_PASSWORD, PASSWORD, MQTT_USER/MQTT_PASSWORD,
+        and DJANGO_SECRET_KEY.
+        Evalink web UI: `http://<host>:18000`. pgAdmin: `http://<host>:18001`
+        (login email `admin@evalink.local`, password = PGADMIN_DEFAULT_PASSWORD or
+        POSTGRES_PASSWORD if unset; register server host `db`, port `5432`, user
+        `evalink`, database `evalink`).
+        First web container start installs Python packages (may take a few minutes).
+        After install: `docker compose exec web python manage.py createsuperuser`

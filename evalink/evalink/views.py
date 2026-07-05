@@ -24,30 +24,76 @@ import aprslib
 
 load_dotenv()
 
+# ADS-B dump1090-style alt_baro/alt_geom are feet; RemoteID uses meters for alt.
+FEET_TO_METERS = 0.3048
+
+
+def aircraft_feature_altitude_meters(features):
+    if not isinstance(features, dict):
+        return None
+    is_remoteid = features.get('source') == 'remoteid'
+
+    def _as_float(value):
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _raw(key):
+        raw = features.get(key)
+        if raw is None:
+            return None
+        if isinstance(raw, str) and raw.strip().lower() in ('', 'ground'):
+            return None
+        return _as_float(raw)
+
+    if is_remoteid:
+        for key in ('alt', 'altitude'):
+            v = _raw(key)
+            if v is not None:
+                return int(round(v))
+        return None
+
+    for key in ('alt_baro', 'alt_geom', 'altitude', 'alt'):
+        feet = _raw(key)
+        if feet is not None:
+            return int(round(feet * FEET_TO_METERS))
+    return None
+
 
 def stalenode(request):
-    """Return comma-separated hardware node IDs of nodes outside inner geofence, within outer geofence, that have not reported location for delay minutes. Excludes nodes that have not reported in the last 6 hours. No auth required."""
+    """Return JSON listing stale stations (same selection as before: outside inner geofence, inside outer, quiet for delay minutes, seen within 6h). Each station includes ids and MQTT-oriented fields (topic, gateway from, to, channel) for downlink envelopes; hardware_node is the meshtastic hex id for CLI --request-position. No auth required."""
     try:
         delay_minutes = int(request.GET.get('delay', ''))
     except (ValueError, TypeError):
-        return HttpResponse('delay parameter (integer minutes) required', status=400)
+        return JsonResponse({'error': 'delay parameter (integer minutes) required'}, status=400)
     if delay_minutes < 0:
-        return HttpResponse('delay must be non-negative', status=400)
-    try:
-        campus = Campus.objects.get(name=os.getenv('CAMPUS'))
-    except Campus.DoesNotExist:
-        return HttpResponse('', content_type='text/plain')
-    inner_fence = campus.inner_geofence
-    if not inner_fence:
-        return HttpResponse('', content_type='text/plain')
-    outer_fence = campus.outer_geofence
-    cutoff = timezone.now() - timedelta(minutes=delay_minutes)
-    six_hours_ago = timezone.now() - timedelta(hours=6)
+        return JsonResponse({'error': 'delay must be non-negative'}, status=400)
+    topic_root = (os.getenv('MQTT_TOPIC') or '').strip()
+    mqtt_downlink_topic = f'{topic_root}/2/json/mqtt/' if topic_root else ''
     gateway_number = os.getenv('MQTT_NODE_NUMBER')
     try:
         gateway_number = int(gateway_number) if gateway_number else None
     except (ValueError, TypeError):
         gateway_number = None
+    base = {
+        'delay_minutes': delay_minutes,
+        'mqtt_downlink_topic': mqtt_downlink_topic,
+        'gateway_node_number': gateway_number,
+        'stations': [],
+    }
+    try:
+        campus = Campus.objects.get(name=os.getenv('CAMPUS'))
+    except Campus.DoesNotExist:
+        return JsonResponse(base)
+    inner_fence = campus.inner_geofence
+    if not inner_fence:
+        return JsonResponse(base)
+    outer_fence = campus.outer_geofence
+    cutoff = timezone.now() - timedelta(minutes=delay_minutes)
+    six_hours_ago = timezone.now() - timedelta(hours=6)
     qs = Station.objects.filter(
         last_position__isnull=False,
         last_position__updated_at__lt=cutoff,
@@ -55,16 +101,81 @@ def stalenode(request):
     ).exclude(station_type='infrastructure').exclude(station_type='ignore')
     if gateway_number is not None:
         qs = qs.exclude(hardware_number=gateway_number)
+
     def in_outer(lat, lon):
         return outer_fence is None or not outer_fence.outside(lat, lon)
+
     stale = [s for s in qs if s.outside(inner_fence) and in_outer(s.last_position.latitude, s.last_position.longitude)]
-    body = ','.join(str(s.hardware_node) for s in stale)
-    return HttpResponse(body, content_type='text/plain')
+    base['stations'] = [
+        {
+            'id': s.id,
+            'name': s.name,
+            'short_name': s.short_name,
+            'hardware_node': s.hardware_node,
+            'hardware_number': s.hardware_number,
+            'channel': 0,
+            'last_position_updated_at': s.last_position.updated_at.isoformat(),
+        }
+        for s in stale
+    ]
+    return JsonResponse(base)
 
 
 @login_required
 def index(request):
-    return render(request, "map.html")
+    """Render map with default campus from user profile or env; pass coords for initial map view."""
+    default_campus_id = None
+    default_latitude = None
+    default_longitude = None
+    try:
+        env_campus = Campus.objects.get(name=os.getenv('CAMPUS'))
+        default_campus_id = env_campus.id
+        default_latitude = env_campus.latitude
+        default_longitude = env_campus.longitude
+    except (Campus.DoesNotExist, TypeError):
+        pass
+    profile = getattr(request.user, 'profile', None)
+    if profile is None:
+        try:
+            profile, _ = UserProfile.objects.get_or_create(user=request.user)
+        except Exception:
+            profile = None
+    if profile and profile.campus_id:
+        default_campus_id = profile.campus_id
+        default_latitude = profile.campus.latitude
+        default_longitude = profile.campus.longitude
+    context = {
+        'default_campus_id': default_campus_id,
+        'default_latitude': default_latitude,
+        'default_longitude': default_longitude,
+    }
+    return render(request, "map.html", context)
+
+
+@login_required
+def set_profile_campus(request):
+    """Create or update the current user's profile and set campus to the given campus_id (POST, JSON body)."""
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=405)
+    try:
+        body = json.loads(request.body)
+        campus_id = body.get('campus_id')
+    except (json.JSONDecodeError, TypeError):
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    if campus_id is not None:
+        try:
+            campus_id = int(campus_id)
+        except (ValueError, TypeError):
+            return JsonResponse({'error': 'campus_id must be an integer or null'}, status=400)
+        try:
+            Campus.objects.get(pk=campus_id)
+        except Campus.DoesNotExist:
+            return JsonResponse({'error': 'Campus not found'}, status=404)
+    profile, _ = UserProfile.objects.get_or_create(user=request.user)
+    profile.campus_id = campus_id
+    profile.save()
+    return JsonResponse({'ok': True, 'campus_id': profile.campus_id})
+
 
 @login_required
 def features(request):
@@ -885,47 +996,57 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 
 @login_required
 def aircraft(request):
-    """Return aircraft data from database, limited to entries updated within the last 15 minutes"""
-    # Get the cutoff time (15 minutes ago)
+    """Return aircraft with latest positions from the last 15 minutes."""
     cutoff_time = timezone.now() - timedelta(minutes=15)
-    
-    # Query aircraft updated within the last 15 minutes
-    aircraft_list = Aircraft.objects.filter(updated_at__gte=cutoff_time).select_related('campus')
-    
-    # Build aircraft data from database records
+
+    # Latest position per aircraft within the freshness window.
+    recent_positions = (
+        AircraftPositionLog.objects
+        .filter(updated_at__gte=cutoff_time)
+        .select_related('aircraft')
+        .order_by('aircraft_id', '-updated_at')
+        .distinct('aircraft_id')
+    )
+
     aircraft_data = []
-    for aircraft in aircraft_list:
+    for position in recent_positions:
+        aircraft = position.aircraft
         if not aircraft.features:
-            continue
-        
-        # Extract data from features JSONField
-        features = aircraft.features
-        lat = features.get('lat')
-        lon = features.get('lon')
-        
-        # Skip if no position data
-        if lat is None or lon is None:
-            continue
-        
-        # Build aircraft object in expected format
+            features = {}
+        else:
+            features = aircraft.features
+
+        # Position from AircraftPositionLog; metadata from latest aircraft.features when present.
+        altitude = position.altitude
+        if altitude is None:
+            altitude = aircraft_feature_altitude_meters(features)
+        if altitude is not None:
+            altitude = int(round(altitude))
+        ground_speed = position.ground_speed
+        if ground_speed is None:
+            ground_speed = features.get('gs')
+        ground_track = position.ground_track
+        if ground_track is None:
+            ground_track = features.get('track')
+
         aircraft_obj = {
             'hex': aircraft.hex,
-            'lat': lat,
-            'lon': lon,
-            'alt_baro': features.get('alt_baro'),
-            'gs': features.get('gs'),
-            'track': features.get('track'),
+            'lat': position.latitude,
+            'lon': position.longitude,
+            'altitude': altitude,
+            'gs': ground_speed,
+            'track': ground_track,
             'flight': features.get('flight'),
             'squawk': features.get('squawk'),
             'category': features.get('category'),
             'messages': features.get('messages'),
             'seen': features.get('seen'),
-            'updated_at': aircraft.updated_at.isoformat() if aircraft.updated_at else None,
+            'source': features.get('source'),
+            'updated_at': position.updated_at.isoformat() if position.updated_at else None,
         }
-        
+
         aircraft_data.append(aircraft_obj)
-    
-    # Return in expected format
+
     return JsonResponse({
         'now': int(timezone.now().timestamp()),
         'aircraft': aircraft_data

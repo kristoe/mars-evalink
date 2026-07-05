@@ -1,4 +1,7 @@
+from datetime import timezone as datetime_timezone
+
 from django.db import models
+from django.conf import settings
 from django.contrib.auth.models import User
 
 from django.utils import timezone
@@ -46,6 +49,7 @@ class StationMeasure(models.Model):
 class PositionLog(models.Model):
     message_id = models.BigIntegerField(db_index=True, null=True)
     station = models.ForeignKey(Station, on_delete=models.CASCADE, db_index=True)
+    campus = models.ForeignKey('Campus', on_delete=models.SET_NULL, null=True, blank=True, db_index=True)
     latitude = models.FloatField(db_index=True)
     longitude = models.FloatField(db_index=True)
     altitude = models.FloatField(null=True)
@@ -54,6 +58,42 @@ class PositionLog(models.Model):
     timestamp = models.DateTimeField(null=True, db_index=True)
     updated_at = models.DateTimeField(null=False, db_index=True, auto_now=True)
     updated_on = models.DateField(null=True, db_index=True)
+
+class AircraftPositionLog(models.Model):
+    message_id = models.BigIntegerField(db_index=True, null=True)
+    aircraft = models.ForeignKey('Aircraft', on_delete=models.CASCADE, db_index=True)
+    campus = models.ForeignKey('Campus', on_delete=models.SET_NULL, null=True, blank=True, db_index=True)
+    latitude = models.FloatField(db_index=True)
+    longitude = models.FloatField(db_index=True)
+    altitude = models.FloatField(null=True)
+    ground_speed = models.FloatField(null=True)
+    ground_track = models.FloatField(null=True)
+    timestamp = models.DateTimeField(null=True, db_index=True)
+    timestamp_minute = models.DateTimeField(null=True, db_index=True)
+    updated_at = models.DateTimeField(null=False, db_index=True, auto_now=True)
+    updated_on = models.DateField(null=True, db_index=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['aircraft', 'latitude', 'longitude', 'timestamp_minute'],
+                name='unique_aircraftpositionlog_aircraft_lat_lon_minute',
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.timestamp is not None:
+            ts = self.timestamp
+            if timezone.is_naive(ts):
+                ts = timezone.make_aware(ts, datetime_timezone.utc)
+            self.timestamp_minute = ts.replace(second=0, microsecond=0)
+        update_fields = kwargs.get('update_fields')
+        if update_fields is not None and self.timestamp is not None:
+            u = list(update_fields)
+            if 'timestamp_minute' not in u:
+                u.append('timestamp_minute')
+            kwargs['update_fields'] = u
+        super().save(*args, **kwargs)
 
 class TelemetryLog(models.Model):
     message_id = models.BigIntegerField(db_index=True, null=True, unique=True)
@@ -113,6 +153,12 @@ class Geofence(models.Model):
     longitude2 = models.FloatField()
     def outside(self, lat, lon):
         return lat < self.latitude1 or lat > self.latitude2 or lon < self.longitude1 or lon > self.longitude2
+
+class UserProfile(models.Model):
+    """One-to-one extension of User; use for app-specific user data (e.g. campus)."""
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='profile', db_index=True)
+    campus = models.ForeignKey('Campus', on_delete=models.SET_NULL, null=True, blank=True, db_index=True)
+
 
 class Campus(models.Model):
     name = models.CharField(max_length=64, db_index=True, null=False)

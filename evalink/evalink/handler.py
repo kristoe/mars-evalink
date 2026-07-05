@@ -3,7 +3,8 @@ django.setup()
 
 from evalink.models import *
 from django.db import IntegrityError
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from django.utils import timezone as django_timezone
 import pytz
 import os
 
@@ -194,47 +195,175 @@ def iso_time(_seconds):
     # nodes are reporting current time incorrectly, so disregard and return now in iso
     return datetime.now().isoformat()
 
-def process_adsb_aircraft(hex_code, message):
-    # Extract latitude and longitude from message
-    lat = message.get('lat')
-    lon = message.get('lon')
+# ADS-B barometric/geometric altitudes (dump1090/readsb style) are in feet; store meters in DB.
+FEET_TO_METERS = 0.3048
+
+def process_aircraft(hex_code, message):
+    def _as_float(value):
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_timestamp(value, fallback):
+        if not value or not isinstance(value, str):
+            return fallback
+        try:
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return fallback
+        if parsed.tzinfo is None:
+            return django_timezone.make_aware(parsed, django_timezone.utc)
+        return parsed
+
+    def _altitude_meters_from_message(msg, is_remoteid):
+        if not isinstance(msg, dict):
+            return None
+
+        def _raw_value(key):
+            raw = msg.get(key)
+            if raw is None:
+                return None
+            if isinstance(raw, str):
+                lowered = raw.strip().lower()
+                if lowered in ('', 'ground'):
+                    return None
+            return _as_float(raw)
+
+        if is_remoteid:
+            for key in ('alt', 'altitude'):
+                value = _raw_value(key)
+                if value is not None:
+                    return int(round(value))
+            return None
+
+        for key in ('alt_baro', 'alt_geom', 'altitude', 'alt'):
+            feet = _raw_value(key)
+            if feet is not None:
+                return int(round(feet * FEET_TO_METERS))
+        return None
+
+    is_remoteid = isinstance(message, dict) and 'ID' in message
+
+    # Accept lat/lon or latitude/longitude from aircraft / drone feeds
+    lat = _as_float(message.get('lat', message.get('latitude')))
+    lon = _as_float(message.get('lon', message.get('long', message.get('longitude'))))
     
     # Skip if no position data
     if lat is None or lon is None:
         # print(f'skipping aircraft {hex_code} because it has no position data')
         return
     
-    # Check all campuses to see if aircraft is within outer geofence
+    def _save_aircraft_for_campus(campus):
+        tz = pytz.timezone(campus.time_zone)
+        current_time = datetime.now(timezone.utc)
+        current_time_tz = current_time.astimezone(tz)
+        today = current_time_tz.date()
+        timestamp = _parse_timestamp(message.get('iso'), current_time)
+
+        aircraft, created = Aircraft.objects.get_or_create(
+            hex=hex_code,
+            defaults={
+                'campus': campus,
+                'features': message,
+                'updated_at': current_time,
+                'updated_on': today,
+            }
+        )
+
+        prev_features = aircraft.features if isinstance(aircraft.features, dict) else {}
+        if isinstance(message, dict):
+            merged_features = {**prev_features, **message}
+        else:
+            merged_features = message
+
+        if not created:
+            aircraft.campus = campus
+            aircraft.features = merged_features
+            aircraft.updated_at = current_time
+            aircraft.updated_on = today
+            aircraft.save()
+
+        mf = merged_features if isinstance(merged_features, dict) else {}
+        altitude_for_log = _altitude_meters_from_message(
+            merged_features if isinstance(merged_features, dict) else message,
+            is_remoteid,
+        )
+
+        ts_for_minute = timestamp
+        if django_timezone.is_naive(ts_for_minute):
+            ts_for_minute = django_timezone.make_aware(ts_for_minute, timezone.utc)
+        minute_start = ts_for_minute.replace(second=0, microsecond=0)
+        minute_end = minute_start + timedelta(minutes=1)
+        existing = (
+            AircraftPositionLog.objects.filter(
+                aircraft=aircraft,
+                latitude=lat,
+                longitude=lon,
+                timestamp__gte=minute_start,
+                timestamp__lt=minute_end,
+            )
+            .order_by('-timestamp')
+            .first()
+        )
+
+        try:
+            if existing:
+                existing.campus = campus
+                existing.altitude = altitude_for_log
+                existing.ground_speed = _as_float(mf.get('speed', mf.get('gs')))
+                existing.ground_track = _as_float(mf.get('course', mf.get('track')))
+                existing.timestamp = timestamp
+                existing.timestamp_minute = minute_start
+                existing.updated_on = today
+                existing.updated_at = current_time
+                existing.save(
+                    update_fields=[
+                        'campus',
+                        'altitude',
+                        'ground_speed',
+                        'ground_track',
+                        'timestamp',
+                        'timestamp_minute',
+                        'updated_on',
+                        'updated_at',
+                    ]
+                )
+                return
+
+            AircraftPositionLog.objects.create(
+                aircraft=aircraft,
+                campus=campus,
+                latitude=lat,
+                longitude=lon,
+                altitude=altitude_for_log,
+                ground_speed=_as_float(mf.get('speed', mf.get('gs'))),
+                ground_track=_as_float(mf.get('course', mf.get('track'))),
+                timestamp=timestamp,
+                timestamp_minute=minute_start,
+                updated_on=today,
+                updated_at=current_time,
+            )
+        except IntegrityError:
+            # Concurrent listener inserted an equivalent row first.
+            return
+
+    # RemoteID messages should use explicit CAMPUS routing (previous run_remoteid_feed behavior)
+    if 'ID' in message:
+        campus_name = (os.getenv('CAMPUS') or '').strip()
+        if not campus_name:
+            return
+        campus = Campus.objects.filter(name=campus_name).first()
+        if campus is None:
+            return
+        _save_aircraft_for_campus(campus)
+        return
+
+    # ADS-B style messages remain geofence-gated
     campuses = Campus.objects.filter(outer_geofence__isnull=False).select_related('outer_geofence')
-    
     for campus in campuses:
         if campus.outer_geofence and not campus.outer_geofence.outside(lat, lon):
-            # Aircraft is within this campus's outer geofence
-            tz = pytz.timezone(campus.time_zone)
-            current_time = datetime.now(timezone.utc)
-            current_time_tz = current_time.astimezone(tz)
-            today = current_time_tz.date()
-            
-            # Update or create Aircraft record
-            aircraft, created = Aircraft.objects.get_or_create(
-                hex=hex_code,
-                defaults={
-                    'campus': campus,
-                    'features': message,
-                    'updated_at': current_time,
-                    'updated_on': today,
-                }
-            )
-            
-            if not created:
-                # Update existing record
-                aircraft.campus = campus
-                aircraft.features = message
-                aircraft.updated_at = current_time
-                aircraft.updated_on = today
-                aircraft.save()
-            
-            # print(f'aircraft {aircraft.hex} updated at {current_time} on {today}')
+            _save_aircraft_for_campus(campus)
             return
-    
-    # Aircraft is not within any campus outer geofence, do nothing
